@@ -8,7 +8,8 @@
     "start": "next start",
     "types:check": "next typegen && tsc --noEmit",
     "lint": "biome check",
-    "format": "biome format --write"
+    "format": "biome format --write",
+    "deploy": "pnpm build && npx --yes wrangler pages deploy ./out --project-name=vouch-engineering --branch=main"
   },
   "dependencies": {
     "cn": "^0.5.2",

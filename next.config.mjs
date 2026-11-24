@@ -1,22 +1,19 @@
 import { createMDX } from 'fumadocs-mdx/next';
 
 const withMDX = createMDX();
+const basePath = process.env.GITHUB_ACTIONS ? '/vouch-engineering' : '';
 
 /** @type {import('next').NextConfig} */
 const config = {
-  reactStrictMode: true,
-  async rewrites() {
-    return [
-      {
-        source: '/docs/:path*.md',
-        destination: '/llms.mdx/docs/:path*.md',
-      },
-      {
-        source: '/docs/:path*.txt',
-        destination: '/llms.mdx/docs/:path*.txt',
-      },
-    ];
+  output: 'export',
+  basePath,
+  env: {
+    NEXT_PUBLIC_BASE_PATH: basePath,
   },
+  images: {
+    unoptimized: true,
+  },
+  reactStrictMode: true,
 };
 
 export default withMDX(config);

@@ -1,32 +1,54 @@
 ---
-title: "ADR-0001: Data Storage Stack"
-description: Why Vouch runs PostgreSQL 16 + pgvector, PgBouncer in transaction mode, and Redis 7 / Valkey.
+title: "ADR-0001: Polyglot Monorepo & Core Data Store Topology"
+description: Repository boundaries and storage architecture across PostgreSQL 16 + pgvector, PgBouncer, and Redis / Valkey.
 ---
 
 - **Status:** Accepted
 - **Date:** 2026-11-26
+- **Deciders:** Vouch Engineering
 
 ## Context
 
-`Vouch` is a two-sided sponsorship marketplace handling financial payouts (`Protected Campaign Funds` + double-entry accounting), multi-tenant brand/creator data, AI semantic search over `512`-dimensional video transcript embeddings, and high-frequency API/LLM rate limiting. We need a storage layer that runs identically in `$0` local Docker development and managed AWS production without unnecessary database sprawl.
+`Vouch` is a multi-tenant two-sided sponsorship marketplace combining:
+
+1. **Financial & Contractual Workflows:** Double-entry accounting (`ledger_entries`), two-tranche payout state machines, and strict tenant data isolation across brands and creators.
+2. **Hybrid Creator Retrieval:** Lexical (`BM25`) and semantic (`512`-dimensional embedding) search across creator video transcripts paired with relational filters (median views, pricing, verification state).
+3. **High-Concurrency Stateless Services:** Web BFF (`Next.js`), synchronous API workers (`FastAPI`), durable background workers, and an internal LLM gateway enforcing per-tenant request and token rate limits.
+
+We need a repository layout and storage topology that enforce clear service boundaries, strong financial consistency, and parity between local development and managed AWS infrastructure without premature operational sprawl.
 
 ## Decision
 
-### 1. Primary Relational & Vector Store (`PostgreSQL 16` + `pgvector`)
+### 1. Polyglot Monorepo Layout
 
-- Standard `PostgreSQL 16` lacks a native vector column type for AI embeddings. Rather than operating a separate external vector database (`Pinecone` or `Qdrant`), which introduces dual-write synchronization bugs when creator records or permissions change, we enable `pgvector` inside our primary Postgres database so relational filters, foreign keys, and vector similarity search execute inside one `ACID` store.
-- We choose `PostgreSQL` over document databases (`MongoDB`) because `Vouch` manages multi-table financial ledger entries where strict schema enforcement, primary/foreign key constraints, row-level security (`RLS`), and `FOR UPDATE SKIP LOCKED` worker queues are required to prevent even `1`-cent accounting drift. Flexible nested fields use `JSONB` columns where needed.
+All application, ML, and infrastructure code lives in a single versioned repository:
 
-### 2. Connection Pooling (`PgBouncer` in `transaction` Mode)
+- `apps/web/`: `Next.js 15` (`React 19`, `TypeScript`, `Node.js 24 LTS`) managed via `pnpm` workspaces.
+- `packages/contracts/` & `packages/evals/`: Shared API schemas and CI evaluation harnesses.
+- `services/{api,worker,gateway}/`: `Python 3.12` (`uv`) services isolated by runtime role (stateless HTTP API, durable background worker, and internal LLM rate-limiting/routing gateway).
+- `labs/ml-internals/`: Offline training and benchmarking (`XGBoost` anomaly scoring, `QLoRA` fine-tuning) isolated from production container dependencies.
+- `infra/`: Database configuration and modular AWS `Terraform`.
 
-- Every direct client connection to Postgres spawns a separate OS process (~`5-10 MB` RAM). Without pooling, idle API connections waiting on external calls (`Stripe`, LLM APIs) exhaust Postgres memory.
-- Placing `PgBouncer` in front of Postgres with `POOL_MODE=transaction` ensures a client only borrows one of the ~`20` backend Postgres connections between `BEGIN` and `COMMIT`, returning the connection to the pool immediately once the transaction commits.
+### 2. Primary System of Record & Vector Store (`PostgreSQL 16` + `pgvector`)
 
-### 3. Ephemeral In-RAM Store (`Redis 7` / `Valkey`-Compatible)
+`PostgreSQL 16` serves as the single transactional system of record for both relational entities and `pgvector` embeddings (`halfvec(512)` indexed with `HNSW`). All primary keys use time-ordered `UUIDv7`, monetary values are stored as `BIGINT` integer cents, and tenant-scoped tables enforce `FORCE ROW LEVEL SECURITY` (`RLS`).
 
-- Short-lived, sub-millisecond lookups and auto-expiring counters (such as `60`-second API and LLM token rate-limit buckets) live in `Redis` (`RAM`) so high-frequency temporary writes do not hit Postgres SSD storage on every request. In AWS production, the same wire protocol runs on managed `ElastiCache for Valkey` (`~33%` lower cost with zero code changes).
+### 3. Transaction-Mode Connection Pooling (`PgBouncer`)
+
+All stateless application services connect through `PgBouncer` configured with `POOL_MODE=transaction` and `scram-sha-256` authentication rather than opening direct backend connections to PostgreSQL.
+
+### 4. Ephemeral In-Memory State (`Redis 7` / `Valkey`)
+
+`Redis 7` (`Valkey`-compatible wire protocol) is dedicated strictly to sub-millisecond ephemeral state: sliding/token-bucket rate limiters (`RPM` / `TPM`), short-TTL caches, and transient coordination. No source-of-truth business or financial records are stored in `Redis`.
+
+## Alternatives Considered
+
+- **Dedicated Vector Database (`Pinecone` / `Qdrant`):** Rejected for V1 (`< 10M` transcript chunks). Splitting relational metadata and vector indexes across two independent data stores introduces dual-write drift on account updates/deletions and prevents single-query execution of relational filters + `RLS` + vector similarity. Re-evaluate only if `HNSW` index memory competes with transactional `shared_buffers`.
+- **Document Database (`MongoDB` / `DynamoDB`):** Rejected as primary store. Marketplace queries traverse entities bidirectionally (`organizations <-> campaigns <-> deals <-> creators`), double-entry accounting requires strict multi-row `ACID` invariants (`FOREIGN KEY` and `CHECK` constraints), and background job claiming relies on `SELECT ... FOR UPDATE SKIP LOCKED`. Variable platform metadata is stored in indexed `JSONB` columns where schema flexibility is needed.
+- **Direct PostgreSQL Connections or Session Pooling:** Rejected. Holding backend PostgreSQL processes idle while awaiting external I/O (`Stripe`, social OAuth APIs, LLM providers) exhausts connection slots under burst traffic.
 
 ## Consequences
 
-- **Local vs Production Parity:** `docker-compose.yml` runs `pgvector/pgvector:pg16`, `edoburu/pgbouncer` (`scram-sha-256`, `transaction` mode), and `redis:7-alpine` locally at `$0`, while AWS production maps the same connection URLs (`DATABASE_URL`, `REDIS_URL`) to `RDS PostgreSQL 16`, `PgBouncer / RDS Proxy`, and `ElastiCache`.
-- **Transaction-Mode Constraint:** Because `PgBouncer` recycles backend connections after every `COMMIT`, session-level state must never leak across requests; tenant context variables must always use transaction-scoped `SET LOCAL` inside `BEGIN ... COMMIT`.
+- **Operational Simplicity & Parity:** Local development runs `pgvector/pgvector:pg16`, `PgBouncer`, and `Redis 7` via `docker-compose.yml`, mapping via environment configuration (`DATABASE_URL`, `REDIS_URL`) to AWS `RDS PostgreSQL 16`, `PgBouncer / RDS Proxy`, and `ElastiCache (Valkey)` in production.
+- **Transaction-Mode Pooling Invariants:** Because `PgBouncer` reassigns backend connections after each `COMMIT`, session-level PostgreSQL features (`SET` without `LOCAL`, session advisory locks, `LISTEN/NOTIFY`, and unguarded session prepared statements) must not be used on pooled connections. Tenant `RLS` context must always be set via transaction-scoped `SET LOCAL` inside explicit `BEGIN ... COMMIT` blocks.
+- **Cache Disposability:** `Redis` is treated as non-durable; a full `Redis` flush or failover must degrade gracefully without affecting deal state or ledger integrity.

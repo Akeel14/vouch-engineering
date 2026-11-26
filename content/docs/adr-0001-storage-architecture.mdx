@@ -1,0 +1,32 @@
+---
+title: "ADR-0001: Data Storage Stack"
+description: Why Vouch runs PostgreSQL 16 + pgvector, PgBouncer in transaction mode, and Redis 7 / Valkey.
+---
+
+- **Status:** Accepted
+- **Date:** 2026-11-26
+
+## Context
+
+`Vouch` is a two-sided sponsorship marketplace handling financial payouts (`Protected Campaign Funds` + double-entry accounting), multi-tenant brand/creator data, AI semantic search over `512`-dimensional video transcript embeddings, and high-frequency API/LLM rate limiting. We need a storage layer that runs identically in `$0` local Docker development and managed AWS production without unnecessary database sprawl.
+
+## Decision
+
+### 1. Primary Relational & Vector Store (`PostgreSQL 16` + `pgvector`)
+
+- Standard `PostgreSQL 16` lacks a native vector column type for AI embeddings. Rather than operating a separate external vector database (`Pinecone` or `Qdrant`), which introduces dual-write synchronization bugs when creator records or permissions change, we enable `pgvector` inside our primary Postgres database so relational filters, foreign keys, and vector similarity search execute inside one `ACID` store.
+- We choose `PostgreSQL` over document databases (`MongoDB`) because `Vouch` manages multi-table financial ledger entries where strict schema enforcement, primary/foreign key constraints, row-level security (`RLS`), and `FOR UPDATE SKIP LOCKED` worker queues are required to prevent even `1`-cent accounting drift. Flexible nested fields use `JSONB` columns where needed.
+
+### 2. Connection Pooling (`PgBouncer` in `transaction` Mode)
+
+- Every direct client connection to Postgres spawns a separate OS process (~`5-10 MB` RAM). Without pooling, idle API connections waiting on external calls (`Stripe`, LLM APIs) exhaust Postgres memory.
+- Placing `PgBouncer` in front of Postgres with `POOL_MODE=transaction` ensures a client only borrows one of the ~`20` backend Postgres connections between `BEGIN` and `COMMIT`, returning the connection to the pool immediately once the transaction commits.
+
+### 3. Ephemeral In-RAM Store (`Redis 7` / `Valkey`-Compatible)
+
+- Short-lived, sub-millisecond lookups and auto-expiring counters (such as `60`-second API and LLM token rate-limit buckets) live in `Redis` (`RAM`) so high-frequency temporary writes do not hit Postgres SSD storage on every request. In AWS production, the same wire protocol runs on managed `ElastiCache for Valkey` (`~33%` lower cost with zero code changes).
+
+## Consequences
+
+- **Local vs Production Parity:** `docker-compose.yml` runs `pgvector/pgvector:pg16`, `edoburu/pgbouncer` (`scram-sha-256`, `transaction` mode), and `redis:7-alpine` locally at `$0`, while AWS production maps the same connection URLs (`DATABASE_URL`, `REDIS_URL`) to `RDS PostgreSQL 16`, `PgBouncer / RDS Proxy`, and `ElastiCache`.
+- **Transaction-Mode Constraint:** Because `PgBouncer` recycles backend connections after every `COMMIT`, session-level state must never leak across requests; tenant context variables must always use transaction-scoped `SET LOCAL` inside `BEGIN ... COMMIT`.
